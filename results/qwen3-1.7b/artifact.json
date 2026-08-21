@@ -1,0 +1,31 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "recipe": "recipes/qwen3-1.7b.sh",
+  "source_commit": "aed0f86",
+  "job": "penkia/6a8841567c5c7dd37923326c",
+  "artifact": {
+    "repo": "penkia/catq-qwen3-1.7b-ternary-st-epoch60-boundary-depth28",
+    "revision": "163e019f52d2f9133487cc6099aea6c0fc347f8e",
+    "file": "ternary.pt",
+    "bytes": 1864759227,
+    "sha256": "90db5b73529de33b36467b064fb1c2467accc2211fcfec07be2b785b71b5cc98"
+  },
+  "metrics": {
+    "file": "metrics.json",
+    "bytes": 33909,
+    "sha256": "8c16984d7b7e5782ba58289066ee1b1421ea6adf68afc94576f7ef9c4030e9a1"
+  },
+  "result": {
+    "ppl": 38.7528,
+    "kl_fp_q": 1.2035,
+    "top1_agreement": 0.5415,
+    "weighted_nonzero": 0.5201,
+    "quantized_linears": 196,
+    "training_seconds": 9090
+  },
+  "oracle": {
+    "ppl": 34.51,
+    "kl_fp_q": 1.0157,
+    "top1_agreement": 0.5786
+  }
+}
