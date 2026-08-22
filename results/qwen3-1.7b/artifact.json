@@ -1,17 +1,22 @@
 {
   "model": "Qwen/Qwen3-1.7B",
   "recipe": "recipes/qwen3-1.7b.sh",
-  "source_commit": "aed0f86",
+  "source": {
+    "repo": "https://github.com/penk/ternary-quench",
+    "commit": "987a5cba45b5580de01495e90d961779a4694a7c"
+  },
   "job": "penkia/6a8841567c5c7dd37923326c",
   "artifact": {
     "repo": "penkia/catq-qwen3-1.7b-ternary-st-epoch60-boundary-depth28",
     "revision": "163e019f52d2f9133487cc6099aea6c0fc347f8e",
     "file": "ternary.pt",
+    "url": "https://huggingface.co/penkia/catq-qwen3-1.7b-ternary-st-epoch60-boundary-depth28/resolve/163e019f52d2f9133487cc6099aea6c0fc347f8e/ternary.pt",
     "bytes": 1864759227,
     "sha256": "90db5b73529de33b36467b064fb1c2467accc2211fcfec07be2b785b71b5cc98"
   },
   "metrics": {
     "file": "metrics.json",
+    "url": "https://huggingface.co/penkia/catq-qwen3-1.7b-ternary-st-epoch60-boundary-depth28/resolve/163e019f52d2f9133487cc6099aea6c0fc347f8e/metrics.json",
     "bytes": 33909,
     "sha256": "8c16984d7b7e5782ba58289066ee1b1421ea6adf68afc94576f7ef9c4030e9a1"
   },
