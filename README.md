@@ -23,7 +23,7 @@ uv sync --extra mlx
 
 ## Train
 
-Qwen3-1.7B requires an NVIDIA GPU with BF16 support:
+The reference Qwen3-1.7B recipe was validated on an NVIDIA GPU with BF16 support:
 
 ```sh
 recipes/qwen3-1.7b.sh
@@ -54,8 +54,9 @@ Training: 512 C4 samples, 2048 tokens, 60-epoch LR plan, boundary at epoch 48,
 19 sliding-window rounds, 9,090 seconds on one H200. The exported artifact has
 196 quantized linear modules and weighted nonzero density 0.5201.
 
-Artifact metadata and the complete training trace are under
-`results/qwen3-1.7b/`.
+The [`ternary.pt` research artifact](https://huggingface.co/penkia/catq-qwen3-1.7b-ternary-st-epoch60-boundary-depth28)
+is public on Hugging Face. Artifact metadata and complete per-round metrics are
+under `results/qwen3-1.7b/`.
 
 ## References
 
