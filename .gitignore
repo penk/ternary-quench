@@ -3,5 +3,8 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 out/
+vendor/
 *.pt
 *.safetensors
+RELEASE.md
+*.swp

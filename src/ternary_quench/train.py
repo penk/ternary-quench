@@ -4,37 +4,44 @@
 # use this file except in compliance with the License. You may obtain a copy of
 # the License at http://www.apache.org/licenses/LICENSE-2.0
 #
-# Portions of this file are derived from SliderQuant by Intel Labs China, which
-# is licensed under the Apache License, Version 2.0. CAT-Q is built on
-# SliderQuant, so its sliding-window procedure is inherited from that project.
-# See https://github.com/deep-optimization/SliderQuant and
-# http://www.apache.org/licenses/LICENSE-2.0
+# Portions of build_window_scheduler and huber_delta_at are derived from
+# SliderQuant by Intel Labs China, licensed under Apache-2.0. They were adapted
+# for a single fill-window parameter, truncated schedules, validation, and the
+# released CAT-Q Huber schedule.
 #
-# NOTICE OF MODIFICATION (Apache-2.0 section 4(b)): the following are derived
-# from `quantize/sliderquant.py` and have been changed here:
-#   * `build_window_scheduler` is a port of its `layer_windows_scheduler`
-#     (lines 435-457). Changes: a single `fill_window_size` replaces the separate
-#     `fill_start_window_size` / `fill_end_window_size`; `start_len` is clamped
-#     at zero; the fill size is clamped to the layer count so truncated smoke
-#     runs are well defined; consecutive duplicate windows are removed; and
-#     argument validation is added.
-#   * `huber_delta_at` reproduces its per-window Huber schedule,
-#     `0.1 + r / num_round * huber_loss_max`. The upstream release omits the
-#     `huber_loss_max` argparse definition, so it is an explicit argument here.
-#
-# Other references to SliderQuant in the comments below record *facts* read from
-# its source and released YAML -- batch-size learning-rate scaling, zero weight
-# decay, FP32 activation caches under BF16 autocast, the two-stream student and
-# teacher inputs -- rather than copied code. `calibration_batches` is an
-# independent implementation of the standard GPTQ-lineage calibration recipe
-# (random document, reject if shorter than the sequence length, random span),
-# and `round_ste` in quantizer.py is the conventional BinaryConnect
-# straight-through idiom; neither is copied from SliderQuant.
-#
-# The upstream sources carry no copyright headers, SPDX tags, or NOTICE file,
-# so there are no such notices to retain under sections 4(c) and 4(d).
+# NOTICE OF MODIFICATION (Apache-2.0 section 4(b)): this file independently
+# implements the missing CAT-Q training loop and extends it with two-stream
+# reconstruction, boundary export, resumable round checkpoints, mixed-domain
+# diagnostics, CPU offload, and Qwen3/Qwen3.5 decoder layouts.
 
-"""Sliding-window ternary calibration for Qwen3."""
+"""CAT-Q-style sliding-layer reconstruction trainer.
+
+The released BitTern code is inference/export only — `main.py` requires
+`--checkpoint` and logs "Ignored training-only config keys". This is the missing
+optimisation loop, written against their published recipe rather than their code:
+
+    configs/qwen3-1.7b/config.yaml: epochs 60, nsamples 512, batch_size 9, calib c4,
+                            loss huber, grad_clip 1.0, num_layer 4,
+                            sliding_layer 2, r 64, lora_lr 3e-4,
+                            learnable_factor_lr 1.5e-3, progressive_ratio 0.8,
+                            s0 30.0, init_round_thd 0.5
+
+Structure is the standard block-wise PTQ shape (OmniQuant/GPTQ family): slide a
+window of `num_layer` decoder layers with stride `sliding_layer`, and fit the
+quantised window's output to the full-precision window's output under Huber
+loss, optimising only the per-group ternary factors and a LoRA update.
+
+Deliberate deviations from the released inference code, both necessary:
+  * their LoRA A and B both initialise to zeros (a checkpoint overwrites them);
+    that is a dead start for training — zero product, zero gradient — so A gets
+    a normal init and B stays zero, the usual LoRA convention.
+  * runs on MPS. Their `LMClass` does `cuda if available else cpu` with no MPS
+    path, which on Apple Silicon means CPU.
+
+Validation target: their released Qwen3-1.7B checkpoint measures perplexity
+33.44 on our 20K-token corpus (34.51 when their parameters are pushed through
+our own exporter). Ours has to land near that to establish reproduction.
+"""
 
 from __future__ import annotations
 
@@ -42,14 +49,15 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from .quantizer import TernaryQuantizer
 
 
@@ -164,7 +172,16 @@ class QuantLinear(nn.Module):
 
     @torch.no_grad()
     def export_state(self) -> dict:
-        """Export codes, scales, factors, and LoRA parameters."""
+        """Codes + scales, PLUS the learned factors and LoRA pair.
+
+        Mirrors what CAT-Q ships in `parameters.pth`. Without it an artifact cannot be
+        decomposed: our A100 run scored PPL 303,227 while its *aggregate* factors
+        matched the reference, and the published decomposition showed the LoRA carries
+        essentially all the quality (roadmap 2j). Saving only {codes, scales} makes a
+        weak LoRA and weak factors indistinguishable in our own output.
+
+        `export_mlx.py` reads only `codes`/`scales`, so the extra keys are additive.
+        """
         codes, scale = self.export()
         state = {
             "codes": codes,
@@ -178,6 +195,47 @@ class QuantLinear(nn.Module):
             state["lora_B"] = self.lora_B.detach().cpu()
             state["lora_scaling"] = float(self.scaling)
         return state
+
+    @torch.no_grad()
+    def training_state(self) -> dict:
+        """Minimal mutable state needed to resume training from the base model."""
+        state = {
+            "t_scale": self.quantizer.t_scale.detach().cpu().clone(),
+            "t_mu": self.quantizer.t_mu.detach().cpu().clone(),
+            "t_round": self.quantizer.t_round.detach().cpu().clone(),
+            "progress": float(self.progress),
+        }
+        if self.r > 0:
+            state["lora_A"] = self.lora_A.detach().cpu().clone()
+            state["lora_B"] = self.lora_B.detach().cpu().clone()
+        return state
+
+    @torch.no_grad()
+    def load_training_state(self, state: dict) -> None:
+        """Restore a state produced by :meth:`training_state`, shape-strictly."""
+        targets = {
+            "t_scale": self.quantizer.t_scale,
+            "t_mu": self.quantizer.t_mu,
+            "t_round": self.quantizer.t_round,
+        }
+        if self.r > 0:
+            targets.update({"lora_A": self.lora_A, "lora_B": self.lora_B})
+        unknown = set(state) - {"progress", *targets}
+        if unknown:
+            raise ValueError(
+                f"unknown QuantLinear checkpoint fields: {sorted(unknown)}"
+            )
+        missing = set(targets) - set(state)
+        if missing:
+            raise ValueError(f"QuantLinear checkpoint is missing: {sorted(missing)}")
+        for name, target in targets.items():
+            value = state[name]
+            if value.shape != target.shape:
+                raise ValueError(
+                    f"checkpoint {name} shape {tuple(value.shape)} != {tuple(target.shape)}"
+                )
+            target.copy_(value.to(device=target.device, dtype=target.dtype))
+        self.progress = float(state["progress"])
 
 
 @contextlib.contextmanager
@@ -202,8 +260,61 @@ def fp_target(layers):
             m.bypass = False
 
 
-TARGET_SUFFIXES = ("q_proj", "k_proj", "v_proj", "o_proj",
-                   "gate_proj", "up_proj", "down_proj")
+QWEN3_TARGET_SUFFIXES = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+)
+QWEN35_LINEAR_ATTENTION_SUFFIXES = (
+    "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+)
+# Backward-compatible public name used by analysis helpers and tests.
+TARGET_SUFFIXES = QWEN3_TARGET_SUFFIXES
+
+
+@dataclass(frozen=True)
+class DecoderLayout:
+    """Architecture-dependent decoder handles needed by the block trainer."""
+
+    model_type: str
+    layers: nn.ModuleList
+    final_norm: nn.Module
+    lm_head: nn.Module
+    hidden_size: int
+    layer_prefix: str
+    target_suffixes: tuple[str, ...]
+
+
+def resolve_decoder_layout(model: nn.Module) -> DecoderLayout:
+    """Resolve Qwen3 and hybrid Qwen3_5 without guessing from tensor names."""
+    model_type = str(model.config.model_type)
+    if model_type == "qwen3_5":
+        text = model.config.text_config
+        decoder = model.model.language_model
+        return DecoderLayout(
+            model_type=model_type,
+            layers=decoder.layers,
+            final_norm=decoder.norm,
+            lm_head=model.lm_head,
+            hidden_size=int(text.hidden_size),
+            layer_prefix="model.language_model.layers",
+            target_suffixes=(
+                *QWEN3_TARGET_SUFFIXES,
+                *QWEN35_LINEAR_ATTENTION_SUFFIXES,
+            ),
+        )
+    if model_type == "qwen3":
+        return DecoderLayout(
+            model_type=model_type,
+            layers=model.model.layers,
+            final_norm=model.model.norm,
+            lm_head=model.lm_head,
+            hidden_size=int(model.config.hidden_size),
+            layer_prefix="model.layers",
+            target_suffixes=QWEN3_TARGET_SUFFIXES,
+        )
+    raise ValueError(
+        f"unsupported model_type {model_type!r}; expected qwen3 or qwen3_5"
+    )
 
 
 def build_window_scheduler(n: int, num_layer: int, sliding_layer: int,
@@ -218,6 +329,11 @@ def build_window_scheduler(n: int, num_layer: int, sliding_layer: int,
           [0], [0,1], [0,1,2], [0,1,2,3]              (growing fill)
           [2-5], [4-7], ... [22-25]                   (11 middle windows)
           [24-27], [25-27], [26-27], [27]             (shrinking fill)
+
+    The middle windows begin at layer `fill - sliding = 2`, so layers 0-1 are
+    trained ONLY by the growing fill windows -- 4 and 3 rounds respectively. Our
+    previous 14-round `range()` gave each of them exactly 1, and they were measurably
+    the two worst layers in both estimator arms (roadmap 2h).
 
     Starts are non-decreasing, which is what lets the caller advance the cached
     activations incrementally instead of recomputing a prefix per round.
@@ -278,11 +394,13 @@ def huber_delta_at(round_idx: int, num_rounds: int, huber_loss_max: float) -> fl
 def wrap_layer(layer: nn.Module, group_size: int, r: int, s0: float,
                gamma: float = 0.8,
                init_scale_from_raw_weights: bool = False,
-               ste: str = "tanh") -> dict[str, QuantLinear]:
+               ste: str = "tanh",
+               target_suffixes: tuple[str, ...] = TARGET_SUFFIXES,
+               ) -> dict[str, QuantLinear]:
     """Replace every target nn.Linear in `layer` with a QuantLinear."""
     wrapped: dict[str, QuantLinear] = {}
     for name, module in list(layer.named_modules()):
-        if not isinstance(module, nn.Linear) or not name.endswith(TARGET_SUFFIXES):
+        if not isinstance(module, nn.Linear) or not name.endswith(target_suffixes):
             continue
         parent = layer
         *path, attr = name.split(".")
@@ -294,6 +412,222 @@ def wrap_layer(layer: nn.Module, group_size: int, r: int, s0: float,
         setattr(parent, attr, ql)
         wrapped[name] = ql
     return wrapped
+
+
+def named_quant_linears(
+    layers, layer_prefix: str = "model.layers"
+) -> dict[str, QuantLinear]:
+    """Return every wrapped projection under its artifact/checkpoint name."""
+    return {
+        f"{layer_prefix}.{layer_index}.{name}": module
+        for layer_index, layer in enumerate(layers)
+        for name, module in layer.named_modules()
+        if isinstance(module, QuantLinear)
+    }
+
+
+def capture_rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+@contextlib.contextmanager
+def preserve_rng_state():
+    """Make diagnostics invisible to the following optimizer trajectory."""
+    state = capture_rng_state()
+    try:
+        yield
+    finally:
+        restore_rng_state(state)
+
+
+def atomic_torch_save(value, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def atomic_json_write(value, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def checkpoint_recipe(args, rounds: list[list[int]]) -> dict:
+    """Stable optimization identity; diagnostics/operations are excluded."""
+    excluded = {
+        "out",
+        "checkpoint_dir",
+        "resume",
+        "stop_after_round",
+        "checkpoint_export_rounds",
+        "prefix_ppl_report_rounds",
+        "prefix_ppl_tokens",
+        "prefix_ppl_ctx",
+    }
+    recipe = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+        if key not in excluded
+    }
+    recipe["rounds"] = rounds
+    return recipe
+
+
+def resume_advance_segments(
+    rounds: list[list[int]], start_round: int
+) -> list[tuple[int, int]]:
+    """Reproduce every activation-cache boundary used before a resumed round.
+
+    Each ordinary ``advance_to`` call ends by materializing FP32 CPU activations.
+    Under BF16 autocast, replacing several such calls with one prefix jump changes
+    rounding and therefore the next optimizer trajectory. The completed deltas
+    contain the final state of every layer at the point it left the sliding
+    window, so replaying the original increasing window starts is exact.
+    """
+    if not 0 < start_round < len(rounds):
+        raise ValueError(
+            f"start_round must lie in [1, {len(rounds) - 1}], got {start_round}"
+        )
+    segments = []
+    current = 0
+    # Include the next round: the uninterrupted driver advances to its start
+    # immediately before entering that round.
+    for window in rounds[:start_round + 1]:
+        start = window[0]
+        if start > current:
+            segments.append((current, start))
+            current = start
+    return segments
+
+
+def save_round_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    round_index: int,
+    round_layers: list[int],
+    layers,
+    recipe: dict,
+    round_metrics: list[dict],
+    partial_export_rounds: list[int],
+    layer_prefix: str = "model.layers",
+) -> Path:
+    """Save only the current window; replaying deltas restores the live model."""
+    current = named_quant_linears(layers, layer_prefix)
+    prefixes = tuple(f"{layer_prefix}.{index}." for index in round_layers)
+    module_states = {
+        name: module.training_state()
+        for name, module in current.items()
+        if name.startswith(prefixes)
+    }
+    if not module_states:
+        raise RuntimeError(f"round {round_index + 1} checkpoint has no QuantLinear state")
+    filename = f"round-{round_index + 1:04d}.pt"
+    payload = {
+        "version": 1,
+        "completed_rounds": round_index + 1,
+        "round_layers": round_layers,
+        "modules": module_states,
+        "rng": capture_rng_state(),
+    }
+    destination = checkpoint_dir / filename
+    atomic_torch_save(payload, destination)
+    completed_rounds = round_index + 1
+    partial_files = [
+        f"partial-round-{value:04d}.pt"
+        for value in partial_export_rounds
+        if value <= completed_rounds
+    ]
+    if completed_rounds in partial_export_rounds:
+        partial = {}
+        for name, module in current.items():
+            codes, scales = module.export()
+            partial[name] = {"codes": codes.cpu(), "scales": scales.cpu()}
+        validate_exported_state(partial)
+        partial_path = checkpoint_dir / f"partial-round-{completed_rounds:04d}.pt"
+        atomic_torch_save(partial, partial_path)
+        print(
+            f"materialized scoreable partial artifact {partial_path}: "
+            f"{len(partial)} linears",
+            flush=True,
+        )
+    manifest = {
+        "version": 1,
+        "completed_rounds": completed_rounds,
+        "round_files": [f"round-{index + 1:04d}.pt" for index in range(completed_rounds)],
+        "partial_files": partial_files,
+        "recipe": recipe,
+        "round_metrics": round_metrics,
+    }
+    atomic_json_write(manifest, checkpoint_dir / "manifest.json")
+    return destination
+
+
+def read_checkpoint_manifest(checkpoint_dir: Path, recipe: dict) -> dict:
+    path = checkpoint_dir / "manifest.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"resume requested but checkpoint manifest is missing: {path}")
+    manifest = json.loads(path.read_text())
+    if manifest.get("version") != 1:
+        raise ValueError(f"unsupported checkpoint version: {manifest.get('version')}")
+    if manifest.get("recipe") != recipe:
+        raise ValueError("checkpoint recipe does not match the requested run")
+    completed = int(manifest.get("completed_rounds", 0))
+    expected_files = [f"round-{index + 1:04d}.pt" for index in range(completed)]
+    if manifest.get("round_files") != expected_files:
+        raise ValueError("checkpoint round files are not contiguous")
+    return manifest
+
+
+def restore_round_checkpoints(
+    checkpoint_dir: Path,
+    manifest: dict,
+    *,
+    layers,
+    rounds: list[list[int]],
+    wrap_kwargs: dict,
+    layer_prefix: str = "model.layers",
+    wrapper_dtype: torch.dtype | None = None,
+) -> dict:
+    """Rebuild wrapped layers from the base model and apply round deltas in order."""
+    latest_rng = None
+    for round_index, filename in enumerate(manifest["round_files"]):
+        path = checkpoint_dir / filename
+        if not path.is_file():
+            raise FileNotFoundError(f"checkpoint delta is missing: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("version") != 1 or payload.get("completed_rounds") != round_index + 1:
+            raise ValueError(f"bad checkpoint metadata in {path}")
+        if payload.get("round_layers") != rounds[round_index]:
+            raise ValueError(f"checkpoint schedule mismatch in {path}")
+        for layer_index in rounds[round_index]:
+            if wrapper_dtype is not None:
+                layers[layer_index].to(dtype=wrapper_dtype)
+            wrap_layer(layers[layer_index], **wrap_kwargs)
+        modules = named_quant_linears(layers, layer_prefix)
+        for name, state in payload["modules"].items():
+            if name not in modules:
+                raise KeyError(f"checkpoint module is absent from model: {name}")
+            modules[name].load_training_state(state)
+        latest_rng = payload["rng"]
+        del payload
+    if latest_rng is None:
+        raise ValueError("cannot restore an empty checkpoint")
+    return latest_rng
 
 
 def progress_at(epoch: int, total_epochs: int) -> float:
@@ -315,6 +649,20 @@ def progress_at(epoch: int, total_epochs: int) -> float:
     if not 0 <= epoch < total_epochs:
         raise ValueError(f"epoch {epoch} outside [0, {total_epochs})")
     return (epoch + 1) / total_epochs
+
+
+def kwargs_for_layer(layer: nn.Module, layer_kwargs: dict) -> dict:
+    """Select architecture-specific kwargs without changing the Qwen3 path."""
+    by_type = layer_kwargs.get("__by_block_type__")
+    if by_type is None:
+        return layer_kwargs
+    block_type = getattr(layer, "block_type", None)
+    if block_type not in by_type:
+        raise KeyError(
+            f"no captured kwargs for decoder block type {block_type!r}; "
+            f"available={sorted(by_type)}"
+        )
+    return by_type[block_type]
 
 
 def batches_per_epoch(n_samples: int, batch_size: int) -> int:
@@ -343,7 +691,7 @@ def _diagnose_nonfinite_window(layers, x: torch.Tensor, *, layer_kwargs: dict,
                 parameter, f"{log_prefix} step {step} layer {layer_offset} parameter {name}"
             )
         with torch.no_grad():
-            out = layer(x, **layer_kwargs)
+            out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
             x = out[0] if isinstance(out, tuple) else out
         require_finite_tensor(
             x, f"{log_prefix} step {step} layer {layer_offset} output"
@@ -367,10 +715,90 @@ def hard_forward(layers):
         for m, (ste, progress) in zip(touched, saved, strict=True):
             m.quantizer.ste = ste
             m.progress = progress
+        for m, (ste, progress) in zip(touched, saved, strict=True):
+            if m.quantizer.ste != ste or m.progress != progress:
+                raise RuntimeError("hard-forward diagnostic did not restore quantizer state")
+
+
+def load_prefix_ppl_tokens(tokenizer, n_tokens: int) -> torch.Tensor:
+    """Load the pinned WikiText stream used by ``tools/catq/ppl.py``."""
+    from datasets import load_dataset
+
+    dataset = load_dataset(
+        "Salesforce/wikitext", "wikitext-2-raw-v1", split="test"
+    )
+    text = "\n\n".join(dataset["text"])
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) < n_tokens:
+        raise ValueError(f"WikiText has {len(ids)} tokens, need {n_tokens}")
+    return torch.tensor(ids[:n_tokens], dtype=torch.long)
+
+
+def prefix_perplexity(
+    model: nn.Module,
+    layers,
+    token_ids: torch.Tensor,
+    *,
+    ctx: int,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+) -> dict[str, float | int]:
+    """Score the current hard prefix with the untouched FP suffix in-place.
+
+    This is the same non-overlapping, second-half protocol as ``ppl.py``. It
+    avoids exporting and transferring a multi-gigabyte partial artifact merely
+    to decide whether a paid run should continue.
+    """
+    if ctx <= 1:
+        raise ValueError("prefix-PPL context must be greater than one")
+    n_chunks = token_ids.numel() // ctx
+    if not n_chunks:
+        raise ValueError(f"prefix-PPL needs at least {ctx} tokens")
+    half = ctx // 2
+    total_nll_all = 0.0
+    total_nll_half = 0.0
+    n_all = 0
+    n_half = 0
+    with torch.no_grad(), hard_forward(layers):
+        for chunk_index in range(n_chunks):
+            chunk = token_ids[
+                chunk_index * ctx:(chunk_index + 1) * ctx
+            ].unsqueeze(0).to(device)
+            with autocast_context(device, amp_dtype):
+                logits = model(chunk[:, :-1], use_cache=False).logits
+            require_finite_tensor(logits, f"prefix-PPL chunk {chunk_index + 1} logits")
+            nll = F.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                chunk[:, 1:].reshape(-1),
+                reduction="none",
+            )
+            require_finite_tensor(nll, f"prefix-PPL chunk {chunk_index + 1} NLL")
+            total_nll_all += float(nll.sum())
+            n_all += nll.numel()
+            tail = nll[half - 1:]
+            total_nll_half += float(tail.sum())
+            n_half += tail.numel()
+    mean_all = total_nll_all / n_all
+    mean_half = total_nll_half / n_half
+    return {
+        "prefix_ppl_all": math.exp(mean_all),
+        "prefix_ppl_second_half": math.exp(mean_half),
+        "prefix_ppl_tokens": n_chunks * ctx,
+        "prefix_ppl_ctx": ctx,
+        "prefix_ppl_chunks": n_chunks,
+    }
 
 
 def centered(residual: torch.Tensor) -> torch.Tensor:
-    """Remove the per-channel mean over every non-channel axis."""
+    """Remove the per-channel mean over every non-channel axis.
+
+    Roadmap 2o measured that a systematic per-channel offset in the reconstruction
+    residual is far cheaper in output quality than equally energetic token-dependent
+    noise -- discarding 5.9% of our depth-20 artifact's error energy bought -0.16 PPL
+    as an offset and +2.85 PPL as isotropic noise. Huber prices the two identically,
+    so this makes the loss blind to the cheap one and lets the optimiser dump error
+    there instead of into noise.
+    """
     return residual - residual.mean(dim=tuple(range(residual.dim() - 1)), keepdim=True)
 
 
@@ -504,7 +932,7 @@ def kl_positions(sequence_length: int, count: int, device) -> torch.Tensor:
 
 def _run_decoder_layers(layers, x: torch.Tensor, layer_kwargs: dict) -> torch.Tensor:
     for layer in layers:
-        out = layer(x, **layer_kwargs)
+        out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
         x = out[0] if isinstance(out, tuple) else out
     return x
 
@@ -620,8 +1048,12 @@ def reconstruction_loss(layers, inps, targets, *, layer_kwargs: dict,
                         amp_dtype: torch.dtype | None = None) -> dict[str, float]:
     """Window reconstruction plus the error decomposition, at full hardness.
 
-    ``offset_amplitude`` is ``||mean_c d|| * sqrt(N) / ||d||``. Squaring it gives
-    the offset's share of residual energy.
+    Returns the loss *and* how the residual is spent, because a centered objective
+    creates a null direction: the optimiser can drive the centered loss down while
+    growing an unbounded common offset, and no finite-value check would notice.
+    `offset_amplitude` is `||mean_c d|| * sqrt(N) / ||d||` -- an AMPLITUDE ratio, so
+    square it for the energy share -- and `noise_rel` is the non-systematic part
+    relative to the target, which is the quantity 2o found tracks quality.
     """
     total_objective_loss = 0.0
     total_raw_loss = 0.0
@@ -638,7 +1070,7 @@ def reconstruction_loss(layers, inps, targets, *, layer_kwargs: dict,
             tgt = targets[start:stop].to(device)
             with autocast_context(device, amp_dtype):
                 for layer in layers:
-                    out = layer(x, **layer_kwargs)
+                    out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
                     x = out[0] if isinstance(out, tuple) else out
                 objective_loss = window_loss(
                     x, tgt, huber_delta=huber_delta, center=center
@@ -664,7 +1096,9 @@ def reconstruction_loss(layers, inps, targets, *, layer_kwargs: dict,
     offset_energy = n_rows * float(mean_c.square().sum())
     offset_energy_fraction = offset_energy / sq_d if sq_d else 0.0
     return {
-        # Always report the ordinary uncentered Huber loss separately.
+        # Keep this name comparable across every historical arm: it is always the
+        # ordinary, uncentred deployed Huber loss.  A centered arm's actual
+        # training objective is reported separately below.
         "hard_reconstruction_loss": total_raw_loss / total_samples,
         "hard_objective_loss": total_objective_loss / total_samples,
         "offset_norm": float(mean_c.norm()),
@@ -673,6 +1107,96 @@ def reconstruction_loss(layers, inps, targets, *, layer_kwargs: dict,
         "noise_rel": math.sqrt(max(sq_d - offset_energy, 0.0) / sq_tgt) if sq_tgt else 0.0,
         "max_abs_activation": max_abs,
     }
+
+
+def domain_endpoint_diagnostics(
+    layers,
+    inps,
+    targets,
+    domain_labels: torch.Tensor,
+    *,
+    layer_kwargs: dict,
+    batch_size: int,
+    device,
+    huber_delta: float,
+    center: bool,
+    amp_dtype: torch.dtype | None,
+    params_lora: list[torch.Tensor],
+    params_factor: list[torch.Tensor],
+) -> dict[str, float]:
+    """Measure each domain's endpoint loss and gradient without updating state.
+
+    Each gradient is formed from the mean objective within that domain,
+    independent of its row count. The weighted values then apply the mixed
+    artifact's nominal loss coefficients. No optimiser state is touched.
+    """
+    if domain_labels.ndim != 1 or len(domain_labels) != len(inps):
+        raise ValueError("domain labels must align with calibration rows")
+    all_params = params_lora + params_factor
+    gradients: dict[str, list[torch.Tensor]] = {}
+    metrics: dict[str, float] = {}
+
+    for name, label in (("general", 0), ("ayot", 1)):
+        indices = torch.nonzero(domain_labels == label, as_tuple=False).flatten()
+        if not len(indices):
+            continue
+        for parameter in all_params:
+            parameter.grad = None
+        loss_sum = 0.0
+        for start in range(0, len(indices), batch_size):
+            idx = indices[start:start + batch_size]
+            x = inps[idx].to(device)
+            with torch.no_grad():
+                tgt = targets[idx].to(device)
+            with autocast_context(device, amp_dtype):
+                for layer in layers:
+                    out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
+                    x = out[0] if isinstance(out, tuple) else out
+                loss = window_loss(x, tgt, huber_delta=huber_delta, center=center)
+            require_finite_tensor(loss, f"{name} endpoint objective")
+            sample_fraction = len(idx) / len(indices)
+            (loss * sample_fraction).backward()
+            loss_sum += float(loss.detach()) * sample_fraction
+
+        domain_grads = [
+            (torch.zeros_like(parameter, device="cpu") if parameter.grad is None
+             else parameter.grad.detach().float().cpu().clone())
+            for parameter in all_params
+        ]
+        gradients[name] = domain_grads
+        metrics[f"domain_loss_{name}"] = loss_sum
+        metrics[f"domain_grad_norm_{name}"] = math.sqrt(
+            sum(float(gradient.square().sum()) for gradient in domain_grads)
+        )
+        metrics[f"domain_rows_{name}"] = float(len(indices))
+
+    for parameter in all_params:
+        parameter.grad = None
+
+    if set(gradients) == {"general", "ayot"}:
+        r_loss = float((domain_labels == 1).float().mean())
+        general_norm = metrics["domain_grad_norm_general"]
+        ayot_norm = metrics["domain_grad_norm_ayot"]
+        dot = sum(
+            float((general * ayot).sum())
+            for general, ayot in zip(
+                gradients["general"], gradients["ayot"], strict=True
+            )
+        )
+        denom = general_norm * ayot_norm
+        weighted_general = (1.0 - r_loss) * general_norm
+        weighted_ayot = r_loss * ayot_norm
+        weighted_total = weighted_general + weighted_ayot
+        metrics.update({
+            "domain_r_loss": r_loss,
+            "domain_grad_cosine": dot / denom if denom else 0.0,
+            "domain_weighted_grad_general": weighted_general,
+            "domain_weighted_grad_ayot": weighted_ayot,
+            "domain_ayot_grad_share_norm": (
+                weighted_ayot / weighted_total if weighted_total else 0.0
+            ),
+        })
+    return metrics
 
 
 def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
@@ -687,7 +1211,8 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
                  lm_head: nn.Module | None = None, kl_grad_fraction: float = 0.0,
                  kl_every: int = 4, kl_position_count: int = 128,
                  kl_norm_batches: int = 4, kl_weight_min: float = 0.0,
-                 kl_weight_max: float = 0.1) -> dict[str, float]:
+                 kl_weight_max: float = 0.1,
+                 domain_labels: torch.Tensor | None = None) -> dict[str, float]:
     params_lora, params_factor = [], []
     factor_params: dict[str, list[torch.Tensor]] = {
         "scale": [], "mu": [], "round": [],
@@ -788,7 +1313,15 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
             "kl_probe_weight_min": 0.0,
             "kl_probe_weight_max": 0.0,
         }
-    # The released CAT-Q configuration uses zero weight decay for both groups.
+    # Both weight decays MUST be 0: SliderQuant sets weight_decay=0.0 explicitly
+    # on the LoRA and learned-factor groups. AdamW's decoupled decay makes the update
+    # dt = -lr*(m/sqrt(v) + wd*t), so any decay imposes an LR-INVARIANT equilibrium
+    # on the factors: they stall where the normalised gradient balances wd*t. With
+    # AdamW's 0.01 default that equilibrium sat at a=1.31 (t=0.64) against the
+    # reference checkpoint's a~1.74 (t=1.90), and no amount of extra steps or LR
+    # moved it -- exactly the plateau measured in roadmap 2g-3. Decaying a
+    # quantiser's scale/threshold toward its init is an anti-pattern; these are
+    # calibration parameters, not weights to regularise.
     opt = torch.optim.AdamW([
         {"params": params_lora, "lr": lora_lr, "weight_decay": lora_wd},
         {"params": params_factor, "lr": factor_lr, "weight_decay": factor_wd},
@@ -849,7 +1382,7 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
             forward_context = torch.no_grad() if replay_hard else contextlib.nullcontext()
             with forward_context, autocast_context(device, amp_dtype):
                 for layer in layers:
-                    out = layer(x, **layer_kwargs)
+                    out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
                     x = out[0] if isinstance(out, tuple) else out
                 local_loss = window_loss(x, tgt, huber_delta=huber_delta, center=center)
                 raw_hard_loss = (
@@ -947,7 +1480,7 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
                     tgt = targets[start:stop].to(device)
                 with autocast_context(device, amp_dtype):
                     for layer in layers:
-                        out = layer(x, **layer_kwargs)
+                        out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
                         x = out[0] if isinstance(out, tuple) else out
                     endpoint_loss = window_loss(
                         x, tgt, huber_delta=huber_delta, center=center
@@ -1064,7 +1597,18 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
         device=device, huber_delta=huber_delta, center=center, deployed=True,
         amp_dtype=amp_dtype,
     )
+    domain_metrics = (
+        domain_endpoint_diagnostics(
+            layers, inps, targets, domain_labels,
+            layer_kwargs=layer_kwargs, batch_size=batch_size, device=device,
+            huber_delta=huber_delta, center=center, amp_dtype=amp_dtype,
+            params_lora=params_lora, params_factor=params_factor,
+        )
+        if domain_labels is not None else {}
+    )
     hard_loss = deployed["hard_reconstruction_loss"]
+    factor_states = [m.quantizer.deployed_state(m.merged_weight()) for m in mods]
+    hard_nonzero_count = sum(int((codes != 0).sum()) for codes in final_codes)
     metrics = {
         "soft_loss_last_batch": final_soft_loss,
         "soft_total_loss_last_batch": final_total_loss,
@@ -1087,8 +1631,22 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
         ),
         "kl_steps": kl_steps,
         "kl_loss_mean": kl_loss_sum / kl_steps if kl_steps else 0.0,
+        "factor_scale_mean": sum(
+            state["scale_factor"] for state in factor_states
+        ) / len(factor_states),
+        "factor_mu_mean": sum(
+            state["mu_factor"] for state in factor_states
+        ) / len(factor_states),
+        "factor_round_mean": sum(
+            state["round_factor"] for state in factor_states
+        ) / len(factor_states),
+        "hard_nonzero_mean": sum(
+            state["nonzero"] for state in factor_states
+        ) / len(factor_states),
+        "hard_nonzero_weighted": hard_nonzero_count / code_total,
         **kl_calibration,
         **deployed,
+        **domain_metrics,
     }
     for name in factor_params:
         metrics[f"grad_{name}_first"] = grad_first[name]
@@ -1117,6 +1675,19 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
         + " (first/mean/last)",
         flush=True,
     )
+    if domain_metrics:
+        print(
+            f"  {log_prefix} domains "
+            f"loss_general={domain_metrics['domain_loss_general']:.6g} "
+            f"loss_ayot={domain_metrics['domain_loss_ayot']:.6g} | "
+            f"grad_norm_general={domain_metrics['domain_grad_norm_general']:.6g} "
+            f"grad_norm_ayot={domain_metrics['domain_grad_norm_ayot']:.6g} "
+            f"cosine={domain_metrics['domain_grad_cosine']:.4f} | "
+            f"r_loss={domain_metrics['domain_r_loss']:.4f} "
+            f"ayot_grad_share_norm="
+            f"{domain_metrics['domain_ayot_grad_share_norm']:.4f}",
+            flush=True,
+        )
     return metrics
 
 
@@ -1127,8 +1698,9 @@ def calibration_batches(tokenizer, n_samples: int, seqlen: int, dataset: str,
                         seed: int = 2):
     """`n_samples` sequences of `seqlen` tokens.
 
-    `c4` matches the CAT-Q config; a local path concatenates a text file, which keeps the
-    trainer runnable offline and is enough for smoke tests.
+    `c4` matches their config. A `.npy` file is a pretokenized, fixed-shape
+    calibration artifact (used by `tools/ayot`); other paths are concatenated as
+    plain text for smoke tests.
     """
     if dataset == "c4":
         from datasets import load_dataset
@@ -1166,6 +1738,19 @@ def calibration_batches(tokenizer, n_samples: int, seqlen: int, dataset: str,
             if len(out) >= n_samples:
                 break
         return torch.tensor(out)
+    if dataset.endswith(".npy"):
+        import numpy as np
+
+        array = np.load(dataset, allow_pickle=False)
+        expected = (n_samples, seqlen)
+        if array.shape != expected:
+            raise ValueError(
+                f"{dataset} has shape {array.shape}; expected {expected} from "
+                "--nsamples/--seqlen"
+            )
+        if array.dtype.kind not in "iu":
+            raise ValueError(f"{dataset} must contain integer token IDs, got {array.dtype}")
+        return torch.from_numpy(array.astype(np.int64, copy=False))
     text = Path(dataset).read_text()
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
     chunks = [ids[i:i + seqlen] for i in range(0, len(ids) - seqlen, seqlen)]
@@ -1175,40 +1760,121 @@ def calibration_batches(tokenizer, n_samples: int, seqlen: int, dataset: str,
     return torch.tensor(picks)
 
 
+def calibration_domains(dataset: str, n_samples: int) -> tuple[torch.Tensor | None, dict]:
+    """Load optional row-domain labels from a pretokenized artifact manifest.
+
+    Mixed agentic artifacts carry a ``row_sources`` list aligned exactly with the
+    first dimension of their ``.npy`` array.  The labels are diagnostics only:
+    they never change sampling, loss weighting, or optimiser updates.
+    """
+    if not dataset.endswith(".npy"):
+        return None, {}
+    manifest_path = Path(dataset).with_suffix(".json")
+    if not manifest_path.exists():
+        return None, {}
+    manifest = json.loads(manifest_path.read_text())
+    sources = manifest.get("row_sources")
+    if sources is None:
+        return None, manifest
+    if len(sources) != n_samples:
+        raise ValueError(
+            f"{manifest_path} has {len(sources)} row_sources; expected {n_samples}"
+        )
+    unknown = sorted(set(sources) - {"c4", "agentic", "ayot"})
+    if unknown:
+        raise ValueError(f"{manifest_path} has unknown row sources: {unknown}")
+    labels = torch.tensor([1 if source in {"agentic", "ayot"} else 0 for source in sources])
+    return labels, manifest
+
+
 @torch.no_grad()
 def capture_layer_inputs(model, layers, ids, device, batch: int = 1,
-                         amp_dtype: torch.dtype | None = None):
+                         amp_dtype: torch.dtype | None = None,
+                         model_type: str = "qwen3"):
     """Hidden states entering layers[0], plus the kwargs the layers need."""
-    captured, kwargs_seen = [], {}
+    captured: list[torch.Tensor] = []
+    kwargs_by_type: dict[str, dict] = {}
 
     class Stop(Exception):
         pass
 
     class Catcher(nn.Module):
-        def __init__(self, inner):
+        def __init__(self, inner, block_type: str, capture_hidden: bool):
             super().__init__()
             self.inner = inner
+            self.block_type = block_type
+            self.capture_hidden = capture_hidden
 
         def forward(self, hidden_states, **kw):
             # Released config: fp16_act=false. SliderQuant writes captured
             # activations into an FP32 cache even though forwards use BF16 AMP.
-            captured.append(hidden_states.detach().float().cpu())
-            kwargs_seen.update({
+            if self.capture_hidden:
+                captured.append(hidden_states.detach().float().cpu())
+            kwargs_seen = {
                 k: v for k, v in kw.items()
                 if k not in ("past_key_value", "past_key_values", "use_cache")
-            })
+            }
             kwargs_seen["use_cache"] = False
+            kwargs_by_type[self.block_type] = kwargs_seen
             raise Stop
 
-    layers[0] = Catcher(layers[0])
-    for i in range(0, ids.shape[0], batch):
+    def probe(layer_index: int, block_type: str, capture_hidden: bool) -> None:
+        inner = layers[layer_index]
+        layers[layer_index] = Catcher(inner, block_type, capture_hidden)
         try:
-            with autocast_context(device, amp_dtype):
-                model(ids[i:i + batch].to(device))
-        except Stop:
-            pass
-    layers[0] = layers[0].inner
-    return torch.cat(captured, dim=0), kwargs_seen
+            starts = range(0, ids.shape[0], batch) if capture_hidden else (0,)
+            for i in starts:
+                try:
+                    with autocast_context(device, amp_dtype):
+                        model(ids[i:i + batch].to(device), use_cache=False)
+                except Stop:
+                    pass
+        finally:
+            layers[layer_index] = inner
+
+    if model_type == "qwen3_5":
+        first_type = str(layers[0].block_type)
+        probe(0, first_type, True)
+        for block_type in ("linear_attention", "full_attention"):
+            if block_type in kwargs_by_type:
+                continue
+            try:
+                index = next(
+                    i for i, layer in enumerate(layers)
+                    if layer.block_type == block_type
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    f"Qwen3_5 decoder has no {block_type} layer"
+                ) from exc
+            probe(index, block_type, False)
+        return torch.cat(captured, dim=0), {
+            "__by_block_type__": kwargs_by_type
+        }
+
+    probe(0, "default", True)
+    return torch.cat(captured, dim=0), kwargs_by_type["default"]
+
+
+def load_training_model(model_name: str, dtype: torch.dtype):
+    """Load the correct Transformers wrapper for a supported Qwen family."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(model_name)
+    if config.model_type == "qwen3_5":
+        from transformers import AutoModelForImageTextToText
+
+        cls = AutoModelForImageTextToText
+    elif config.model_type == "qwen3":
+        cls = AutoModelForCausalLM
+    else:
+        raise ValueError(
+            f"unsupported model_type {config.model_type!r} for {model_name}"
+        )
+    kwargs = {"dtype": dtype, "low_cpu_mem_usage": True}
+    if config.model_type == "qwen3_5":
+        kwargs["attn_implementation"] = "sdpa"
+    return cls.from_pretrained(model_name, **kwargs)
 
 
 def main() -> int:
@@ -1244,7 +1910,9 @@ def main() -> int:
                     help="per-round LR schedule; SliderQuant uses linear with zero warmup")
     ap.add_argument("--loss-center", choices=("none", "channel"), default="none",
                     help="'channel' removes the residual's per-channel mean before "
-                         "Huber, making the loss blind to a systematic offset")
+                         "Huber, making the loss blind to a systematic offset "
+                         "(roadmap 2o). Watch offset_amplitude in the round "
+                         "diagnostics: it is an unpenalised direction.")
     ap.add_argument("--kl-grad-fraction", type=float, default=0.0,
                     help="target downstream-KL gradient magnitude as a fraction of "
                          "the local objective; 0 disables KL")
@@ -1260,15 +1928,17 @@ def main() -> int:
     ap.add_argument("--huber-loss-max", type=float, default=1.0,
                     help="coefficient in delta=0.1 + round/num_rounds * value")
     ap.add_argument("--init-scale-from-raw-weights", action="store_true",
-                    help="use the Qwen3-4B scale initialization")
+                    help="their configs/qwen3-4b setting; every other model leaves it off")
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--progressive-ratio", type=float, default=0.8,
                     help="fraction of epochs in CAT-Q's soft stage (source default 0.8)")
     ap.add_argument(
         "--hard-gradient-mode", choices=("recompute", "replay", "boundary"),
-        default="boundary",
-        help="boundary stops at gamma and hard-exports the soft-stage solution; "
-             "recompute and replay are experimental hard-stage modes",
+        default="recompute",
+        help="recompute = historical hard-forward/soft-backward surrogate; replay = "
+             "CAT-Q section 2.3 literal rule: reuse the final soft-step gradients "
+             "only for the three modulation factors during the hard stage; boundary = "
+             "stop at gamma and hard-export the uncorrupted soft-stage solution",
     )
     ap.add_argument(
         "--hard-stage-abort-ratio", type=float, default=1.5,
@@ -1281,17 +1951,50 @@ def main() -> int:
         "--calib",
         default="c4",
         help="'c4' (source-faithful random documents), 'c4-sequential' (legacy), "
-             "or a path to a text file",
+             "a pretokenized .npy artifact, or a path to a text file",
     )
     ap.add_argument("--seed", type=int, default=2,
                     help="calibration/training seed; CAT-Q's Qwen3-1.7B config uses 2")
     ap.add_argument("--device", default="mps")
+    ap.add_argument(
+        "--base-dtype", choices=("float32", "bfloat16"), default="float32",
+        help="dtype used to hold untrained base layers; qwen3_5 scale runs use "
+             "bfloat16 with --cpu-offload, while active windows remain FP32",
+    )
+    ap.add_argument(
+        "--cpu-offload", action="store_true",
+        help="keep the frozen model on CPU after activation capture and move only "
+             "the active/advancing decoder layers to CUDA in FP32",
+    )
     ap.add_argument(
         "--amp-dtype", choices=("none", "bfloat16"), default="none",
         help="forward-compute autocast; CAT-Q's released Qwen3-1.7B config uses "
              "bfloat16 while keeping active parameters/activation caches FP32",
     )
     ap.add_argument("--max-layers", type=int, default=0, help="0 = all (smoke tests)")
+    ap.add_argument(
+        "--checkpoint-dir", type=Path,
+        help="write one resumable window delta plus a manifest after every round",
+    )
+    ap.add_argument(
+        "--resume", action="store_true",
+        help="restore completed rounds from --checkpoint-dir before continuing",
+    )
+    ap.add_argument(
+        "--stop-after-round", type=int, default=0,
+        help="engineering gate: checkpoint and exit after this many completed rounds",
+    )
+    ap.add_argument(
+        "--checkpoint-export-rounds", type=int, nargs="*", default=[],
+        help="also materialize scoreable hard partial artifacts at these rounds",
+    )
+    ap.add_argument(
+        "--prefix-ppl-report-rounds", type=int, nargs="*", default=[],
+        metavar="ROUND",
+        help="report live hard-prefix WikiText PPL after selected rounds; never abort",
+    )
+    ap.add_argument("--prefix-ppl-tokens", type=int, default=20480)
+    ap.add_argument("--prefix-ppl-ctx", type=int, default=512)
     args = ap.parse_args()
 
     if args.kl_grad_fraction < 0:
@@ -1311,8 +2014,35 @@ def main() -> int:
             ap.error("--kl-norm-batches must be positive")
         if args.kl_weight_min < 0 or args.kl_weight_max < args.kl_weight_min:
             ap.error("invalid KL weight bounds")
+    if args.resume and args.checkpoint_dir is None:
+        ap.error("--resume requires --checkpoint-dir")
+    if args.stop_after_round < 0:
+        ap.error("--stop-after-round must be non-negative")
+    if args.stop_after_round and args.checkpoint_dir is None:
+        ap.error("--stop-after-round requires --checkpoint-dir")
+    if args.checkpoint_export_rounds and args.checkpoint_dir is None:
+        ap.error("--checkpoint-export-rounds requires --checkpoint-dir")
+    if any(value <= 0 for value in args.checkpoint_export_rounds):
+        ap.error("--checkpoint-export-rounds values must be positive")
+    if args.prefix_ppl_tokens <= 0 or args.prefix_ppl_ctx <= 1:
+        ap.error("prefix-PPL tokens must be positive and context must exceed one")
+    if args.prefix_ppl_tokens < args.prefix_ppl_ctx:
+        ap.error("--prefix-ppl-tokens must be at least --prefix-ppl-ctx")
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    if args.cpu_offload:
+        if args.device != "cuda":
+            ap.error("--cpu-offload requires --device cuda")
+        if args.base_dtype != "bfloat16":
+            ap.error("--cpu-offload requires --base-dtype bfloat16")
+        if args.kl_grad_fraction:
+            ap.error("--cpu-offload does not yet support downstream KL suffix passes")
+        if args.prefix_ppl_report_rounds:
+            ap.error(
+                "--cpu-offload uses scoreable partial checkpoints instead of live "
+                "prefix-PPL reports"
+            )
+
+    from transformers import AutoTokenizer
     device = torch.device(args.device)
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else None
     if amp_dtype is not None and device.type != "cuda":
@@ -1322,16 +2052,24 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
-    model.eval().to(device)
+    base_dtype = (
+        torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float32
+    )
+    model = load_training_model(args.model, base_dtype)
+    model.eval()
+    layout = resolve_decoder_layout(model)
+    args.resolved_model_type = layout.model_type
+    args.resolved_layer_prefix = layout.layer_prefix
+    if not args.cpu_offload:
+        model.to(device)
     for p in model.parameters():
         p.requires_grad_(False)
-    all_layers = model.model.layers
+    all_layers = layout.layers
     layers = all_layers
     if args.max_layers:
         layers = layers[: args.max_layers]
     print(f"model {args.model} | {len(layers)} layers | device {device}", flush=True)
-    hidden_size = int(model.config.hidden_size)
+    hidden_size = layout.hidden_size
     cache_gib = args.nsamples * args.seqlen * hidden_size * 4 / (1024 ** 3)
     print(
         f"FP32 host activation cache estimate: {cache_gib:.2f} GiB/tensor, "
@@ -1341,15 +2079,33 @@ def main() -> int:
 
     ids = calibration_batches(tok, args.nsamples, args.seqlen, args.calib, args.seed)
     print(f"calibration: {tuple(ids.shape)} from {args.calib}", flush=True)
+    domain_labels, calibration_manifest = calibration_domains(args.calib, args.nsamples)
+    if domain_labels is not None:
+        print(
+            "calibration domains: "
+            f"general={int((domain_labels == 0).sum())} "
+            f"ayot={int((domain_labels == 1).sum())} "
+            f"r_content={calibration_manifest.get('r_content', float('nan')):.6f} "
+            f"r_loss={calibration_manifest.get('r_loss', float('nan')):.6f}",
+            flush=True,
+        )
+    if args.cpu_offload:
+        print("moving BF16 model to CUDA for layer-0 activation capture", flush=True)
+        model.to(device)
     inps, layer_kwargs = capture_layer_inputs(
-        model, model.model.layers, ids, device, amp_dtype=amp_dtype
+        model, all_layers, ids, device, amp_dtype=amp_dtype,
+        model_type=layout.model_type,
     )
+    if args.cpu_offload:
+        model.to("cpu")
+        torch.cuda.empty_cache()
+        print("returned frozen model to CPU; active windows will use CUDA FP32", flush=True)
     print(f"captured hidden states {tuple(inps.shape)}", flush=True)
 
     def run_layers(sub, x):
         with autocast_context(device, amp_dtype):
             for layer in sub:
-                out = layer(x, **layer_kwargs)
+                out = layer(x, **kwargs_for_layer(layer, layer_kwargs))
                 x = out[0] if isinstance(out, tuple) else out
         return x
 
@@ -1373,27 +2129,102 @@ def main() -> int:
     def advance_to(x, frm: int, to: int, full_precision: bool):
         """Run cached activations through layers [frm, to).
 
-        ``full_precision`` selects the teacher stream. The quantized stream carries
-        accumulated quantization error; the teacher stream does not.
+        `full_precision` selects the stream. SliderQuant keeps **two**
+        (`quantize/sliderquant.py:699-715`):
+
+            windows_fp_inps[:,-1]    = obtain_teacher_output(...)   # fp weights
+            windows_quant_inps[:,-1] = obtain_studnet_output(...)   # quantised
+
+        and builds the target from the *teacher* stream (line 593) while the student
+        forward consumes the quantised one (line 582). The objective is therefore
+        `student(quant input) -> teacher(fp input)`: a distillation target that does
+        not drift.
+
+        We previously advanced one stream and computed the target from it, so the
+        target absorbed all upstream quantisation error. The window could then match
+        a co-drifted target with tiny weights -- which is exactly what we measured:
+        reconstruction loss 0.003-0.015 while PPL was NaN, and a LoRA growing as
+        sqrt(steps) because there was almost no real error signal to descend
+        (roadmap 2k).
         """
         with torch.no_grad():
             sub = layers[frm:to]
+            if args.cpu_offload:
+                sub.to(device=device, dtype=torch.float32)
             ctx = fp_target(sub) if full_precision else contextlib.nullcontext()
-            with ctx:
-                return run_layers_batched(sub, x)
+            try:
+                with ctx:
+                    return run_layers_batched(sub, x)
+            finally:
+                if args.cpu_offload:
+                    sub.to("cpu")
+                    torch.cuda.empty_cache()
 
     n = len(layers)
     expected_linears = sum(
         1
         for layer in layers
         for name, module in layer.named_modules()
-        if isinstance(module, nn.Linear) and name.endswith(TARGET_SUFFIXES)
+        if isinstance(module, (nn.Linear, QuantLinear))
+        and name.endswith(layout.target_suffixes)
     )
     rounds = build_window_scheduler(n, args.num_layer, args.sliding_layer,
                                     args.fill_window_size)
+    if args.stop_after_round > len(rounds):
+        ap.error(
+            f"--stop-after-round {args.stop_after_round} exceeds {len(rounds)} rounds"
+        )
+    if any(value > len(rounds) for value in args.checkpoint_export_rounds):
+        ap.error(
+            f"--checkpoint-export-rounds exceeds the {len(rounds)}-round schedule"
+        )
+    if any(
+        value <= 0 or value > len(rounds)
+        for value in args.prefix_ppl_report_rounds
+    ):
+        ap.error(
+            f"--prefix-ppl-report-rounds must lie in the {len(rounds)}-round schedule"
+        )
     print(f"scheduler: {len(rounds)} rounds over {n} layers "
           f"(num_layer={args.num_layer} sliding={args.sliding_layer} "
           f"fill={args.fill_window_size})", flush=True)
+
+    recipe = checkpoint_recipe(args, rounds)
+    start_round = 0
+    resumed_rng = None
+    round_metrics: list[dict[str, float | int | str]] = []
+    prefix_ppl_ids: torch.Tensor | None = None
+    wrap_kwargs = {
+        "group_size": args.group_size,
+        "r": args.lora_r,
+        "s0": args.s0,
+        "gamma": args.progressive_ratio,
+        "init_scale_from_raw_weights": args.init_scale_from_raw_weights,
+        "ste": args.ste,
+        "target_suffixes": layout.target_suffixes,
+    }
+    if args.resume:
+        manifest = read_checkpoint_manifest(args.checkpoint_dir, recipe)
+        start_round = int(manifest["completed_rounds"])
+        if start_round >= len(rounds):
+            raise ValueError(
+                f"checkpoint already contains all {len(rounds)} rounds; use its final artifact"
+            )
+        resumed_rng = restore_round_checkpoints(
+            args.checkpoint_dir,
+            manifest,
+            layers=layers,
+            rounds=rounds,
+            wrap_kwargs=wrap_kwargs,
+            layer_prefix=layout.layer_prefix,
+            wrapper_dtype=torch.float32 if args.cpu_offload else None,
+        )
+        round_metrics = list(manifest.get("round_metrics", []))
+        print(
+            f"resumed {start_round}/{len(rounds)} completed rounds from "
+            f"{args.checkpoint_dir}",
+            flush=True,
+        )
 
     # `inps` holds the activations entering layer `cur_start`. Window starts are
     # non-decreasing, so advance lazily when a round needs a deeper entry point --
@@ -1405,14 +2236,37 @@ def main() -> int:
     inps_fp = inps.clone()
     del inps
     cur_start = 0
-    round_metrics: list[dict[str, float | int | str]] = []
-    for r_idx, idxs in enumerate(rounds):
+    if start_round:
+        segments = resume_advance_segments(rounds, start_round)
+        for segment_index, (frm, to) in enumerate(segments, 1):
+            inps_q = advance_to(inps_q, frm, to, full_precision=False)
+            inps_fp = advance_to(inps_fp, frm, to, full_precision=True)
+            cur_start = to
+            print(
+                f"resume activation segment {segment_index}/{len(segments)}: "
+                f"layers {frm}..{to - 1}",
+                flush=True,
+            )
+        # Model loading, wrapper construction and activation replay all consume
+        # incidental RNG. Resume from the exact state after the prior round so
+        # the next layer's LoRA initialization and minibatch permutations match.
+        restore_rng_state(resumed_rng)
+        print(
+            f"reconstructed quant/fp streams through {len(segments)} original "
+            f"boundaries at layer {cur_start} for round "
+            f"{start_round + 1}",
+            flush=True,
+        )
+    for r_idx in range(start_round, len(rounds)):
+        idxs = rounds[r_idx]
         start, stop = idxs[0], idxs[-1] + 1
         if start > cur_start:
             inps_q = advance_to(inps_q, cur_start, start, full_precision=False)
             inps_fp = advance_to(inps_fp, cur_start, start, full_precision=True)
             cur_start = start
         window = layers[start:stop]
+        if args.cpu_offload:
+            window.to(device=device, dtype=torch.float32)
         tag = f"{start}..{stop - 1}"
         huber_delta = huber_delta_at(r_idx, len(rounds), args.huber_loss_max)
 
@@ -1421,11 +2275,8 @@ def main() -> int:
         drift = float((inps_q - inps_fp).norm() / inps_fp.norm().clamp(min=1e-6))
         wrapped = {}
         for off, layer in enumerate(window):
-            wrapped.update({f"model.layers.{start + off}.{k}": v
-                            for k, v in wrap_layer(layer, args.group_size, args.lora_r,
-                                                   args.s0, args.progressive_ratio,
-                                                   args.init_scale_from_raw_weights,
-                                                   args.ste).items()})
+            wrapped.update({f"{layout.layer_prefix}.{start + off}.{k}": v
+                            for k, v in wrap_layer(layer, **wrap_kwargs).items()})
         print(f"round {r_idx + 1}/{len(rounds)} layers {tag}: "
               f"{len(wrapped)} newly wrapped linears | Huber delta={huber_delta:.4f} "
               f"| input drift={drift:.4f}", flush=True)
@@ -1440,15 +2291,67 @@ def main() -> int:
                                hard_stage_abort_ratio=args.hard_stage_abort_ratio,
                                amp_dtype=amp_dtype,
                                suffix=all_layers[stop:],
-                               final_norm=model.model.norm, lm_head=model.lm_head,
+                               final_norm=layout.final_norm, lm_head=layout.lm_head,
                                kl_grad_fraction=args.kl_grad_fraction,
                                kl_every=args.kl_every,
                                kl_position_count=args.kl_positions,
                                kl_norm_batches=args.kl_norm_batches,
                                kl_weight_min=args.kl_weight_min,
                                kl_weight_max=args.kl_weight_max,
+                               domain_labels=domain_labels,
                                log_prefix=f"[{tag}]")
+        report_prefix_ppl = r_idx + 1 in args.prefix_ppl_report_rounds
+        if report_prefix_ppl:
+            # The report is observational. Preserve every RNG stream around both
+            # corpus loading and inference so a continuing run follows exactly
+            # the same optimizer trajectory as one with diagnostics disabled.
+            try:
+                with preserve_rng_state():
+                    if prefix_ppl_ids is None:
+                        print("loading pinned WikiText prefix-PPL corpus", flush=True)
+                        prefix_ppl_ids = load_prefix_ppl_tokens(tok, args.prefix_ppl_tokens)
+                    gate_metrics = prefix_perplexity(
+                        model, layers, prefix_ppl_ids, ctx=args.prefix_ppl_ctx,
+                        device=device, amp_dtype=amp_dtype,
+                    )
+            except Exception as exc:  # diagnostic availability must not corrupt a paid run
+                metrics["prefix_ppl_report_error"] = f"{type(exc).__name__}: {exc}"
+                print(
+                    f"WARNING: prefix-PPL report failed at round {r_idx + 1}; "
+                    f"training will continue unchanged: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                metrics.update(gate_metrics)
+                print(
+                    f"PREFIX PPL REPORT round={r_idx + 1} layers=0..{stop - 1} "
+                    f"ppl={gate_metrics['prefix_ppl_second_half']:.4f}",
+                    flush=True,
+                )
         round_metrics.append({"round": r_idx, "layers": tag, **metrics})
+        if args.checkpoint_dir is not None:
+            checkpoint = save_round_checkpoint(
+                args.checkpoint_dir,
+                round_index=r_idx,
+                round_layers=idxs,
+                layers=layers,
+                recipe=recipe,
+                round_metrics=round_metrics,
+                partial_export_rounds=args.checkpoint_export_rounds,
+                layer_prefix=layout.layer_prefix,
+            )
+            print(f"checkpointed round {r_idx + 1}/{len(rounds)} to {checkpoint}", flush=True)
+        if args.stop_after_round == r_idx + 1:
+            print(
+                f"stopped after requested recovery gate: {r_idx + 1}/{len(rounds)} rounds",
+                flush=True,
+            )
+            return 0
+        if args.cpu_offload:
+            window.to("cpu")
+            torch.cuda.empty_cache()
 
     # Export ONCE from the final live model. wrap_layer only returns modules it
     # newly wrapped and skips already-wrapped ones, so exporting per-window shipped
@@ -1459,7 +2362,7 @@ def main() -> int:
     for li, layer in enumerate(layers):
         for name, module in layer.named_modules():
             if isinstance(module, QuantLinear):
-                exported[f"model.layers.{li}.{name}"] = module.export_state()
+                exported[f"{layout.layer_prefix}.{li}.{name}"] = module.export_state()
     if len(exported) != expected_linears:
         raise RuntimeError(
             f"expected {expected_linears} quantised linears, found {len(exported)} at export"
