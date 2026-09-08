@@ -124,6 +124,8 @@ This is an independent implementation of the released CAT-Q method. It uses
 learnable modulation and softened ternarization, then hardens the weights at
 export. CAT-Q's unreleased hard-training phase is not reproduced.
 
+See [CUDA training](docs/cuda-training.md) for hardware requirements and profiling.
+
 ### 4. Export a runnable model
 
 For GGUF, prepare the pinned llama.cpp build:

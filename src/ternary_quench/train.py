@@ -484,6 +484,11 @@ def checkpoint_recipe(args, rounds: list[list[int]]) -> dict:
         for key, value in vars(args).items()
         if key not in excluded
     }
+    # Preserve the identity of legacy checkpoints when new controls are unused.
+    if recipe.get("delta_kernel") in {"auto", "torch"}:
+        recipe.pop("delta_kernel", None)
+    # Storage placement is operational; values, shuffling and precision do not change.
+    recipe.pop("window_cache_gpu", None)
     recipe["rounds"] = rounds
     return recipe
 
@@ -1212,7 +1217,20 @@ def train_window(layers, inps, targets, *, layer_kwargs: dict, epochs: int,
                  kl_every: int = 4, kl_position_count: int = 128,
                  kl_norm_batches: int = 4, kl_weight_min: float = 0.0,
                  kl_weight_max: float = 0.1,
-                 domain_labels: torch.Tensor | None = None) -> dict[str, float]:
+                 domain_labels: torch.Tensor | None = None,
+                 window_cache_gpu: bool | None = None) -> dict[str, float]:
+    from ternary_quench.performance import use_gpu_window_cache
+    needed = sum(x.numel() * x.element_size() for x in (inps, targets)
+                 if x.device.type != "cuda")
+    free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else 0
+    cache_active = use_gpu_window_cache(device.type, window_cache_gpu, needed, free)
+    if cache_active:
+        # Same FP32 values and CPU-seeded row order; only storage placement changes.
+        inps, targets = inps.to(device), targets.to(device)
+        print(f"{log_prefix} GPU window cache: {needed / 1024**3:.2f} GiB", flush=True)
+    elif device.type == "cuda":
+        print(f"{log_prefix} GPU window cache disabled: free={free / 1024**3:.2f} GiB "
+              f"cache={needed / 1024**3:.2f} GiB reserve=16 GiB", flush=True)
     params_lora, params_factor = [], []
     factor_params: dict[str, list[torch.Tensor]] = {
         "scale": [], "mu": [], "round": [],
@@ -1966,6 +1984,10 @@ def main() -> int:
         help="keep the frozen model on CPU after activation capture and move only "
              "the active/advancing decoder layers to CUDA in FP32",
     )
+    ap.add_argument("--window-cache-gpu", action=argparse.BooleanOptionalAction, default=None,
+                    help="default: cache unchanged window arrays on CUDA when memory allows")
+    ap.add_argument("--delta-kernel", choices=("auto", "torch", "fla"), default="auto",
+                    help="auto: FLA for CUDA Qwen3.5 with BF16 AMP; torch for FP32 or CPU/MPS")
     ap.add_argument(
         "--amp-dtype", choices=("none", "bfloat16"), default="none",
         help="forward-compute autocast; CAT-Q's released Qwen3-1.7B config uses "
@@ -2042,7 +2064,7 @@ def main() -> int:
                 "prefix-PPL reports"
             )
 
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
     device = torch.device(args.device)
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else None
     if amp_dtype is not None and device.type != "cuda":
@@ -2051,6 +2073,12 @@ def main() -> int:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
+    from ternary_quench.performance import resolve_delta_backend, select_delta_kernel
+    model_type = AutoConfig.from_pretrained(args.model).model_type
+    args.delta_kernel = resolve_delta_backend(
+        model_type, device.type, args.delta_kernel, args.amp_dtype)
+    if args.delta_kernel != "auto":
+        select_delta_kernel(args.delta_kernel)
     tok = AutoTokenizer.from_pretrained(args.model)
     base_dtype = (
         torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float32
@@ -2299,6 +2327,7 @@ def main() -> int:
                                kl_weight_min=args.kl_weight_min,
                                kl_weight_max=args.kl_weight_max,
                                domain_labels=domain_labels,
+                               window_cache_gpu=args.window_cache_gpu,
                                log_prefix=f"[{tag}]")
         report_prefix_ppl = r_idx + 1 in args.prefix_ppl_report_rounds
         if report_prefix_ppl:

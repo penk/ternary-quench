@@ -8,6 +8,7 @@ license = "Apache-2.0"
 authors = [{ name = "Penk Chen", email = "penkia@gmail.com" }]
 dependencies = [
   "datasets>=3.0.0",
+  "fla-core==0.5.2; sys_platform == 'linux'",
   "huggingface-hub>=1.5.0,<2.0",
   "jsonschema>=4.20",
   "numpy>=1.26,<2",
@@ -32,6 +33,7 @@ mlx = [
 test = ["pytest>=8"]
 
 [project.scripts]
+ternary-quench-profile = "ternary_quench.performance:main"
 ternary-quench = "ternary_quench.train:main"
 ternary-quench-generate = "ternary_quench.generate_traces:main"
 ternary-quench-build-calibration = "ternary_quench.build_calibration:main"

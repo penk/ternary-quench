@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Triton compiles a CUDA helper; managed Python includes its development headers.
+export UV_MANAGED_PYTHON=1
+
 MODEL="${MODEL:-Qwen/Qwen3.8-27B}"
 CALIB="${CALIB:?set CALIB to a mixed 512x2048 calibration .npy}"
 OUT="${OUT:-out/qwen3.8-27b/ternary.pt}"
@@ -9,6 +12,12 @@ RESUME_ARGS=()
 if [[ "${RESUME:-0}" == 1 ]]; then
   RESUME_ARGS=(--resume)
 fi
+
+# Check the real architecture and batch before committing to a long run.
+# A failed toolchain, numerical, or speed gate prevents training.
+timeout 900 uv run ternary-quench-profile \
+  --model "$MODEL" --calib "$CALIB" --batch-size 3 --seed 2 \
+  --report "$(dirname "$OUT")/cuda-profile.json"
 
 uv run ternary-quench \
   --model "$MODEL" --calib "$CALIB" --out "$OUT" \
