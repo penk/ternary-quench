@@ -185,6 +185,23 @@ uv run ternary-quench-export-mlx \
   --out out/TernaryQuench-Qwen3.8-27B-MLX
 ```
 
+To reduce storage further, add `--base3` to pack ternary weights in base-3 encoding
+(1.6 bits/weight instead of 2.0, saving ~20% on weight tensors). Base-3 is a
+**storage-only optimisation** — the model cannot be run directly from the base-3
+directory. Expand it back to standard 2-bit before inference:
+
+```sh
+uv run ternary-quench-export-mlx \
+  --ternary-prefix out/qwen3.8-27b/ternary.pt \
+  --base /path/to/Qwen3.8-27B-4bit \
+  --out out/TernaryQuench-Qwen3.8-27B-MLX-base3 \
+  --base3
+
+uv run ternary-quench-expand-base3 \
+  --model out/TernaryQuench-Qwen3.8-27B-MLX-base3 \
+  --out out/TernaryQuench-Qwen3.8-27B-MLX
+```
+
 ### 5. Evaluate
 
 Check the exported model in its intended runtime, then measure quality.

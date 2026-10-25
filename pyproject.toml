@@ -43,6 +43,7 @@ ternary-quench-repack-gguf = "ternary_quench.repack_gguf:main"
 ternary-quench-smoke = "ternary_quench.smoke_runtime:main"
 ternary-quench-evaluate = "ternary_quench.evaluate_avg5:main"
 ternary-quench-evaluate-mlx = "ternary_quench.evaluate_avg5_mlx:main"
+ternary-quench-expand-base3 = "ternary_quench.expand_base3:main"
 
 [build-system]
 requires = ["hatchling"]

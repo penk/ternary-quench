@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 from safetensors.torch import load_file, save_file
 
-from .packing import pack_mlx_2bit
+from .packing import pack_mlx_2bit, pack_mlx_base3
 
 
 def mlx_stem(name: str) -> str:
@@ -58,6 +58,10 @@ def main() -> int:
                     help="model name stored in config.json (defaults to --out name)")
     ap.add_argument("--repo", help="Hub model repository for the packed output")
     ap.add_argument("--private", action="store_true")
+    ap.add_argument("--base3", action="store_true",
+                    help="use base-3 packing (1.6 bits/weight, flat uint32) instead of "
+                         "2-bit MLX packing; weights stored as 1-D uint32 — requires "
+                         "patch_base3() at load time")
     args = ap.parse_args()
     if args.name is None:
         args.name = args.out.name
@@ -72,6 +76,8 @@ def main() -> int:
         HfFileSystem(token=os.environ.get("HF_TOKEN")).get(
             args.ternary_prefix, str(prefix_path)
         )
+    if prefix_path.is_dir():
+        prefix_path = prefix_path / "ternary.pt"
     if not prefix_path.is_file():
         raise FileNotFoundError(f"ternary prefix is missing: {prefix_path}")
 
@@ -124,7 +130,11 @@ def main() -> int:
             if not np.isin(codes, (-1, 0, 1)).all():
                 raise ValueError(f"non-ternary codes in {stem}")
             shifted = (codes.astype(np.int16) + 1).astype(np.uint8).reshape(rows, cols)
-            tensors[weight_key] = torch.from_numpy(pack_mlx_2bit(shifted))
+            if args.base3:
+                packed_b3, _ = pack_mlx_base3(shifted)
+                tensors[weight_key] = torch.from_numpy(packed_b3)   # 1-D uint32
+            else:
+                tensors[weight_key] = torch.from_numpy(pack_mlx_2bit(shifted))
             tensors[scales_key] = torch.from_numpy(
                 scales.reshape(rows, cols // 128).astype(np.float16)
             )
@@ -172,6 +182,8 @@ def main() -> int:
     base_config["quantization"] = mixed_quant
     base_config["quantization_config"] = mixed_quant
     base_config["_name_or_path"] = args.name
+    if args.base3:
+        base_config["ternary_base3_layers"] = sorted(replaced)
     (args.out / "config.json").write_text(json.dumps(base_config, indent=2) + "\n")
 
     for source in base_path.iterdir():
